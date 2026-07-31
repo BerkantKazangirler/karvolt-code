@@ -1,6 +1,6 @@
 #include <SoftwareSerial.h>
 
-SoftwareSerial loraSerial(10, 11); 
+SoftwareSerial loraSerial(0, 1); 
 
 #define M0 7
 #define M1 6
