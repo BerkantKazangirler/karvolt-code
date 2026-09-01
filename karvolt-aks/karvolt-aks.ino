@@ -1,16 +1,11 @@
+#include <Arduino.h>
 #include <math.h>
 #include <string.h>
 #include <SPI.h>
 #include <mcp_can.h>
 #include <SD.h>
+#include <EEPROM.h>
 #include "config.h"
-
-MCP_CAN CAN(CAN_CS_PIN);
-
-const float R_REF = 1000.0;
-const float R_0 = 10000.0;
-const float T_0 = 298.15;
-const float B_VALUE = 3950;
 
 struct SicaklikVerisi {
   float sicaklik_sensor1;
@@ -38,7 +33,7 @@ struct TelemetriPaketi {
   unsigned long seq;
   unsigned long zaman;
   float hiz;
-  float tmax;
+  SicaklikVerisi sicaklik;
   float voltaj;
   float akim;
   int soc;
@@ -48,6 +43,24 @@ struct TelemetriPaketi {
   unsigned int minHucre;
   ActiveStatus durum;
 };
+
+const int POLE_PAIRS = 4;                 // Motor kutup çifti sayısı
+const float GEAR_RATIO = 5.0;             // Diferansiyel dişli oranı (1:5)
+const float WHEEL_CIRCUMFERENCE = 1.8655; // 90/90-17 tekerlek çevresi (metre)
+
+// Sabit Çarpan K: (3.6 * 10^6 * C) / (POLE_PAIRS * GEAR_RATIO)
+const float SPEED_K_FACTOR = (3.6 * 1000000.0 * WHEEL_CIRCUMFERENCE) / (POLE_PAIRS * GEAR_RATIO);
+const unsigned long MIN_PERIOD_US = 800;  // 75 km/h üstü elektriksel gürültü filtresi
+
+volatile unsigned long period_us = 0;
+volatile unsigned long last_pulse_time = 0;
+
+MCP_CAN CAN(CAN_CS_PIN);
+
+const float R_REF = 1000.0;
+const float R_0 = 10000.0;
+const float T_0 = 298.15;
+const float B_VALUE = 3950;
 
 const unsigned long BMS_REQ_SOC_V_I  = 0x18900140;
 const unsigned long BMS_RESP_SOC_V_I = 0x18904001;
@@ -60,10 +73,11 @@ BmsVerisi sonBmsVerisi = {0, 0, 0, true, 0, 0, false, 0, 0, 0, false};
 
 unsigned long sonGonderimZamani = 0;
 unsigned long sonNextionZamani = 0;
-const unsigned long NEXTION_REFRESH_DELAY = 250; // Nextion ekran yenileme süresi (ms)
+const unsigned long NEXTION_REFRESH_DELAY = 250; 
+char tarih[5];
 
 bool sdHazir = false;
-char dosyaAdi[13]; // 8.3 format: "GGAA-N.CSV"
+char dosyaAdi[13]; 
 
 const int KUYRUK_KAPASITESI = 40;
 TelemetriPaketi kuyruk[KUYRUK_KAPASITESI];
@@ -73,6 +87,16 @@ int kuyrukAdet = 0;
 unsigned long paketSayaci = 0;
 
 unsigned long sonBasariliAckZamani = 0;
+
+void hallISR() {
+  unsigned long current_time = micros();
+  unsigned long delta = current_time - last_pulse_time;
+
+  if (delta > MIN_PERIOD_US) {
+    period_us = delta;
+    last_pulse_time = current_time;
+  }
+}
 
 void kuyrugaEkle(const TelemetriPaketi &p) {
   if (kuyrukAdet < KUYRUK_KAPASITESI) {
@@ -89,11 +113,37 @@ void kuyrugaEkle(const TelemetriPaketi &p) {
 }
 
 float hizKmhOku() {
-  return HIZ_KMH_SABIT;
+  unsigned long delta_us;
+  unsigned long last_time;
+
+  noInterrupts();
+  delta_us = period_us;
+  last_time = last_pulse_time;
+  interrupts();
+
+  if ((micros() - last_time) < 500000 && delta_us > 0) {
+    return SPEED_K_FACTOR / delta_us;
+  }
+  return 0.0;
 }
 
 float izolasyonDirenciOku() {
-  return IZOLASYON_DIRENC_KOHM_SABIT;
+  long adcToplami = 0;
+  for (int i = 0; i < 16; i++) {
+    adcToplami += analogRead(IZOLASYON_PIN);
+    delayMicroseconds(500);
+  }
+  int adcVal = adcToplami / 16;
+
+  if (adcVal >= IMD_ADC_WARN_POS && adcVal <= IMD_ADC_WARN_NEG) {
+    return 9999.0; 
+  } else if (adcVal < IMD_ADC_WARN_POS) {
+    if (adcVal <= IMD_ADC_FAULT_POS) return 30.0;
+    return map(adcVal, IMD_ADC_FAULT_POS, IMD_ADC_WARN_POS, 50, 200);
+  } else {
+    if (adcVal >= IMD_ADC_FAULT_NEG) return 30.0;
+    return map(adcVal, IMD_ADC_WARN_NEG, IMD_ADC_FAULT_NEG, 200, 50);
+  }
 }
 
 float kalanEnerjiHesapla() {
@@ -104,18 +154,25 @@ float kalanEnerjiHesapla() {
   }
 }
 
-ActiveStatus sistemDurumuHesapla(const SicaklikVerisi &sicaklik, float hizKmh, bool telemetriKopuk) {
+ActiveStatus sistemDurumuHesapla(const SicaklikVerisi &sicaklik, float hizKmh, float izolasyonDirenci, bool telemetriKopuk) {
   bool bmsTimeout = (millis() - sonBmsVerisi.sonVeriZamani > SEND_DELAY);
 
-  if (sicaklik.sicaklik_hata || sonBmsVerisi.veri_hata || bmsTimeout || telemetriKopuk) {
+  if (sicaklik.sicaklik_hata || sonBmsVerisi.veri_hata || bmsTimeout) {
     return STATE_ERROR;
   }
   if (sicaklik.sicaklik_max >= SICAKLIK_MAX || hizKmh >= HIZ_KRITIK_KMH) {
     return STATE_CRITICAL;
   }
-  if (sonBmsVerisi.sarjDurumu == 1) {
+  if (izolasyonDirenci <= 50.0) {
+    digitalWrite(ROLE_PIN, LOW);
+    return STATE_IMD;
+  }
+
+  bool sarjDonanimAlgilandi = (digitalRead(SARJ_PIN) == LOW);
+  if (sarjDonanimAlgilandi || sonBmsVerisi.sarjDurumu == 1) {
     return STATE_CHARGING;
   }
+
   if (sonBmsVerisi.sarjDurumu == 2 || hizKmh > 0.5) {
     return STATE_RUNNING;
   }
@@ -131,6 +188,7 @@ const char* durumMetnineCevir(ActiveStatus durum, bool telemetriKopuk) {
     case STATE_CHARGING: return "SARJ OLUYOR";
     case STATE_CRITICAL: return "KRITIK DURUM!";
     case STATE_ERROR:    return "SENSOR/BMS HATASI";
+    case STATE_IMD:      return "IZOLASYON HATASI";
     default:             return "BILINMEYEN";
   }
 }
@@ -153,16 +211,30 @@ void tarihStringOlustur(char* buffer) {
   sprintf(buffer, "%02d%02d", gun, ay);
 }
 
+const int EEPROM_DOSYA_SAYAC_ADRESI = 0;
+
 bool dosyaAdiOlustur() {
-  char tarih[5];
   tarihStringOlustur(tarih);
 
-  for (int n = 1; n <= 999; n++) {
-    sprintf(dosyaAdi, "%s-%d.CSV", tarih, n);
-    if (!SD.exists(dosyaAdi)) {
-      return true;
-    }
+  uint16_t dosyaNo = 0;
+  EEPROM.get(EEPROM_DOSYA_SAYAC_ADRESI, dosyaNo);
+
+  dosyaNo++;
+  EEPROM.put(EEPROM_DOSYA_SAYAC_ADRESI, dosyaNo);
+
+  sprintf(dosyaAdi, "%s_%03d.CSV", tarih, dosyaNo);
+
+  File f = SD.open(dosyaAdi, FILE_WRITE);
+  if (f) {
+    f.println("zaman_ms;paket_tipi;seq;durum;hiz_kmh;T1_C;T2_C;T3_C;Tmax_C;V_bat_V;I_bat_A;SOC;kalan_enerji_Wh;izolasyon_kOhm;max_hucre_mV;min_hucre_mV");
+    f.flush();
+    f.close();
+    Serial.print("Yeni Sürüş Dosyası Açıldı: ");
+    Serial.println(dosyaAdi);
+    return true;
   }
+  
+  Serial.println("HATA: Yeni CSV dosyası oluşturulamadı!");
   return false;
 }
 
@@ -205,13 +277,10 @@ SicaklikVerisi sicaklikOku() {
 
 void bmsTumIstekleriGonder() {
   byte req[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  
   CAN.sendMsgBuf(BMS_REQ_SOC_V_I, 1, 8, req);
   delay(10);
-  
   CAN.sendMsgBuf(BMS_REQ_KAPASITE, 1, 8, req);
   delay(10);
-  
   CAN.sendMsgBuf(BMS_REQ_HUCRE, 1, 8, req);
 }
 
@@ -252,6 +321,13 @@ void nextionKomutBitir() {
 }
 
 void nextionSayiGonder(const char* obj, long deger) {
+  HMI_SERIAL.print(obj);
+  HMI_SERIAL.print(".val=");
+  HMI_SERIAL.print(deger);
+  nextionKomutBitir();
+}
+
+void nextionProgGonder(const char* obj, long deger) {
   HMI_SERIAL.print(obj);
   HMI_SERIAL.print(".val=");
   HMI_SERIAL.print(deger);
@@ -316,13 +392,15 @@ void nextionGuncelle(const SicaklikVerisi &sicaklik, float hizKmh,
   nextionSayiGonder("n0", (long)round(hizKmh));
   nextionSayiGonder("n1", (long)round(sicaklik.sicaklik_max));
   nextionSayiGonder("n2", (long)round(sonBmsVerisi.voltaj));
-  nextionSayiGonder("x2", (long)round(sonBmsVerisi.akim * 10)); // vsc=1
+  nextionSayiGonder("x2", (long)round(sonBmsVerisi.akim * 10));
   nextionMetinGonder("t1", String(sonBmsVerisi.soc) + "%");
-  nextionSayiGonder("n4", (long)round(izolasyonDirenci));
-  nextionSayiGonder("x0", (long)round(sonBmsVerisi.maxHucreVoltaj_mV / 10.0)); // vsc=2 ise 3.24 basar
-nextionSayiGonder("x1", (long)round(sonBmsVerisi.minHucreVoltaj_mV / 10.0)); // vsc=2 ise 3.19 basar
+  nextionSayiGonder("t4", (long)round(izolasyonDirenci));
+  nextionSayiGonder("x0", (long)round(sonBmsVerisi.maxHucreVoltaj_mV / 10.0));
+  nextionSayiGonder("x1", (long)round(sonBmsVerisi.minHucreVoltaj_mV / 10.0));
   nextionSayiGonder("n5", (long)round(kalanEnerjiWh));
   nextionMetinGonder("t0", durumMetnineCevir(durum, telemetriKopuk));
+
+  nextionProgGonder("j0", (long)round(sonBmsVerisi.soc));
 }
 
 bool gonderVeAckBekle(const String &mesaj, unsigned long seq, unsigned long timeoutMs) {
@@ -336,7 +414,7 @@ bool gonderVeAckBekle(const String &mesaj, unsigned long seq, unsigned long time
   String ackBuf = "";
 
   while (millis() - baslangic < timeoutMs) {
-    bmsCanKontrolEt(); // ACK beklerken CAN bus kaçırmamak için oku
+    bmsCanKontrolEt();
 
     while (LORA_SERIAL_P.available()) {
       char c = (char)LORA_SERIAL_P.read();
@@ -345,7 +423,7 @@ bool gonderVeAckBekle(const String &mesaj, unsigned long seq, unsigned long time
         if (ackBuf.startsWith("ACK:")) {
           unsigned long gelenSeq = ackBuf.substring(4).toInt();
           if (gelenSeq == seq) {
-            return true; // ACK doğrulandı
+            return true;
           }
         }
         ackBuf = "";
@@ -355,7 +433,7 @@ bool gonderVeAckBekle(const String &mesaj, unsigned long seq, unsigned long time
       }
     }
   }
-  return false; // ACK zaman aşımı
+  return false;
 }
 
 void setup() {
@@ -363,16 +441,21 @@ void setup() {
   LORA_SERIAL_P.begin(LORA_SERIAL);
   HMI_SERIAL.begin(HMI_BAUD);
 
-  pinMode(19, INPUT_PULLUP);
+  pinMode(HALL_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, RISING);
+
+  pinMode(SARJ_PIN, INPUT_PULLUP);
 
   pinMode(ROLE_PIN, OUTPUT);
   pinMode(ALARM_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LORA_M0, OUTPUT);
   pinMode(LORA_M1, OUTPUT);
 
   digitalWrite(LORA_M0, LOW);
   digitalWrite(LORA_M1, LOW);
   digitalWrite(ALARM_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
   digitalWrite(ROLE_PIN, HIGH);
 
   pinMode(CAN_INT_PIN, INPUT);
@@ -385,16 +468,9 @@ void setup() {
   } else if (!dosyaAdiOlustur()) {
     sdHazir = false;
   } else {
-    File f = SD.open(dosyaAdi, FILE_WRITE);
-    if (f) {
-      f.println("zaman_ms;paket_tipi;seq;durum;hiz_kmh;T1_C;T2_C;T3_C;Tmax_C;V_bat_V;I_bat_A;SOC;kalan_enerji_Wh;izolasyon_kOhm;max_hucre_mV;min_hucre_mV");
-      f.close();
-      sdHazir = true;
-      Serial.print("CSV dosyasi olusturuldu: ");
-      Serial.println(dosyaAdi);
-    } else {
-      sdHazir = false;
-    }
+    sdHazir = true;
+    Serial.print("SD ve CSV Hazir: ");
+    Serial.println(dosyaAdi);
   }
 
   if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
@@ -407,6 +483,9 @@ void setup() {
 
 void loop() {
   SicaklikVerisi sicaklik = sicaklikOku();
+  float hizKmh = hizKmhOku();
+  float kalanEnerjiWh = kalanEnerjiHesapla();
+  float izolasyonDirenci = izolasyonDirenciOku();
 
   if (sicaklik.sicaklik_max >= ALARM_MAX && sicaklik.sicaklik_max < SICAKLIK_MAX) {
     digitalWrite(ALARM_PIN, HIGH);
@@ -415,16 +494,25 @@ void loop() {
   }
 
   if (sicaklik.sicaklik_max >= SICAKLIK_MAX) {
-    digitalWrite(ROLE_PIN, LOW);
+    digitalWrite(ROLE_PIN, LOW); 
+  } else if (sicaklik.sicaklik_max <= (SICAKLIK_MAX - 5)) {
+    digitalWrite(ROLE_PIN, HIGH);
   }
+
+  // if (izolasyonDirenci >= 50.0) {
+  //   digitalWrite(ROLE_PIN, LOW);
+  //   digitalWrite(ALARM_PIN, HIGH);
+  //   digitalWrite(BUZZER_PIN, HIGH);
+  // } else {
+  //   digitalWrite(BUZZER_PIN, LOW);
+  //   digitalWrite(ALARM_PIN, LOW);
+  //   digitalWrite(ROLE_PIN, HIGH);
+  // }
 
   bmsCanKontrolEt();
 
-  float hizKmh = hizKmhOku();
-  float kalanEnerjiWh = kalanEnerjiHesapla();
-  float izolasyonDirenci = izolasyonDirenciOku();
   bool telemetriKopuk = (millis() - sonBasariliAckZamani >= ((unsigned long)LOST_MAX * 1000UL));
-  ActiveStatus mevcutDurum = sistemDurumuHesapla(sicaklik, hizKmh, telemetriKopuk);
+  ActiveStatus mevcutDurum = sistemDurumuHesapla(sicaklik, hizKmh, izolasyonDirenci, telemetriKopuk);
 
   if (millis() - sonNextionZamani >= NEXTION_REFRESH_DELAY) {
     sonNextionZamani = millis();
@@ -445,17 +533,21 @@ void loop() {
     paketSayaci++;
 
     String mesaj = "TYPE:LIVE,SEQ:" + String(paketSayaci) +
-                   ",TIME:" + String(millis()) +
-                   ",SPD:"  + String(hizKmh, 1) +
-                   ",Tmax:" + String(sicaklik.sicaklik_max, 1) +
-                   ",V:"    + String(sonBmsVerisi.voltaj, 1);
+               ",TIME:"  + String(millis()) +
+               ",TARIH:" + String(tarih) +
+               ",HIZ:"   + String(hizKmh, 1) +
+               ",sMax:"  + String(sicaklik.sicaklik_max, 1) +
+               ",V:"     + String(sonBmsVerisi.voltaj, 1) +
+               ",IZO:"   + String(izolasyonDirenci, 0) +
+               ",minV:"  + String(sonBmsVerisi.minHucreVoltaj_mV) +
+               ",maxV:"  + String(sonBmsVerisi.maxHucreVoltaj_mV);
 
     Serial.println("[GONDERILIYOR - CANLI] " + mesaj);
 
     bool ackGeldi = gonderVeAckBekle(mesaj, paketSayaci, 450);
 
     if (ackGeldi) {
-      sonBasariliAckZamani = millis(); // ACK alındı, kopma zamanlayıcısını sıfırla
+      sonBasariliAckZamani = millis();
 
       Serial.print("[ACK ALINDI] Canli paket onaylandi. No: ");
       Serial.println(paketSayaci);
@@ -466,13 +558,17 @@ void loop() {
 
       if (kuyrukAdet > 0) {
         TelemetriPaketi eskiPaket = kuyruk[kuyrukBas];
-        delay(60); // RF modülü yarı-çift yönlü geçiş payı
+        delay(60);
 
         String tekrarMesaj = "TYPE:RETRY,SEQ:" + String(eskiPaket.seq) +
-                             ",TIME:" + String(eskiPaket.zaman) +
-                             ",SPD:"  + String(eskiPaket.hiz, 1) +
-                             ",Tmax:" + String(eskiPaket.tmax, 1) +
-                             ",V:"    + String(eskiPaket.voltaj, 1);
+                     ",TIME:"  + String(eskiPaket.zaman) + 
+                     ",TARIH:" + String(tarih) +
+                     ",HIZ:"   + String(eskiPaket.hiz, 1) +
+                     ",sMax:"  + String(eskiPaket.sicaklik.sicaklik_max, 1) +
+                     ",V:"     + String(eskiPaket.voltaj, 1) +
+                     ",IZO:"   + String(eskiPaket.izolasyon, 0) +
+                     ",minV:"  + String(eskiPaket.minHucre) +
+                     ",maxV:"  + String(eskiPaket.maxHucre);
 
         Serial.println("[GONDERILIYOR - TEKRAR] " + tekrarMesaj);
         bool retryAck = gonderVeAckBekle(tekrarMesaj, eskiPaket.seq, 450);
@@ -484,7 +580,7 @@ void loop() {
           kuyrukBas = (kuyrukBas + 1) % KUYRUK_KAPASITESI;
           kuyrukAdet--;
 
-          csvSatiriYaz("TEKRAR", eskiPaket.seq, eskiPaket.zaman, sicaklik, eskiPaket.hiz,
+          csvSatiriYaz("TEKRAR", eskiPaket.seq, eskiPaket.zaman, eskiPaket.sicaklik, eskiPaket.hiz,
                        eskiPaket.voltaj, eskiPaket.akim, eskiPaket.soc, eskiPaket.kalanEnerji,
                        eskiPaket.izolasyon, eskiPaket.maxHucre, eskiPaket.minHucre, eskiPaket.durum);
         } else {
@@ -499,7 +595,7 @@ void loop() {
       kayipPaket.seq = paketSayaci;
       kayipPaket.zaman = millis();
       kayipPaket.hiz = hizKmh;
-      kayipPaket.tmax = sicaklik.sicaklik_max;
+      kayipPaket.sicaklik = sicaklik;
       kayipPaket.voltaj = sonBmsVerisi.voltaj;
       kayipPaket.akim = sonBmsVerisi.akim;
       kayipPaket.soc = sonBmsVerisi.soc;
