@@ -1,4 +1,4 @@
-# 🏎️ KARVOLT AKS - Araç Kontrol & Telemetri Sistemi
+# KarVolt Projesi# 🏎️ KARVOLT AKS - Araç Kontrol & Telemetri Sistemi
 
 ![Arduino](https://img.shields.io/badge/Board-Arduino%20Mega%202560-00979D?style=for-the-badge&logo=arduino&logoColor=white)
 ![CAN Bus](https://img.shields.io/badge/Protocol-CAN%20Bus%20(29--bit)-00599C?style=for-the-badge)
